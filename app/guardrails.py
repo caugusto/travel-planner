@@ -136,21 +136,28 @@ class SafetyGuardrailPlugin(BasePlugin):
 def require_budget_approval(
     tool: BaseTool, args: dict[str, Any], tool_context: ToolContext
 ) -> dict | None:
-    """Blocks save_trip_plan unless the latest budget audit passed."""
+    """Blocks save_trip_plan unless a budget audit has run.
+
+    Layered control:
+      * no audit at all            -> hard block (deterministic, here)
+      * audit ran, over budget     -> human override required (HITL via
+        ``require_confirmation=needs_budget_override`` on the tool)
+      * audit ran, within budget   -> allowed
+    """
     if tool.name != "save_trip_plan":
         return None
     check = tool_context.state.get("budget_check") or {}
-    if not check.get("within_budget"):
+    if not check:
         log_event(
             "policy_block",
             logging.WARNING,
             tool=tool.name,
-            reason="budget_not_approved",
+            reason="budget_not_audited",
         )
         return {
             "status": "error",
-            "error_message": "Policy: the itinerary has not passed validate_itinerary_budget. "
-            "Present the plan to the traveler with the over-budget warning instead of saving.",
+            "error_message": "Policy: the itinerary has not been run through "
+            "validate_itinerary_budget. Audit it before saving.",
         }
     return None
 

@@ -166,9 +166,39 @@ agents-cli run "<next prompt>" --url "$AGENT_URL" --mode adk --session-id <id pr
 | ID | How to trigger | Expected behaviour | Verify |
 |---|---|---|---|
 | **E1** Upstream API outage | Locally, point `FX_URL` in `app/tools/destination.py` at a bad host, then ask B3 | Agent says the rate is unavailable; no crash | `tool_end` with `status=error`; 3 retries in the `http.get` span |
-| **E2** Policy gate | Unit test `test_budget_policy_gate_blocks_unapproved_save`, or C4 with an impossible budget (`$100`) | `save_trip_plan` refused with the "Policy: ..." message | Log `policy_block` |
+| **E2** Policy gate | Unit test `test_budget_policy_gate_blocks_unaudited_save` | An unaudited `save_trip_plan` is refused with the "Policy: ..." message. Over-budget saves go to **G3** instead | Log `policy_block` |
 | **E3** Long conversation | 7+ turns in one session | Older turns get summarised (compaction every 6 invocations); answers stay coherent | Trace shows a `compact_events` span |
 | **E4** Parallel research | Any C-case | The three scouts overlap in time | In Cloud Trace / playground, the scout spans run concurrently |
+
+### F. Strategic model routing
+
+Run locally with `LOG_LEVEL=INFO` and filter: `grep model_routed`. On Agent Runtime, use
+`jsonPayload.event="model_routed"`. Each line shows `agent`, `baseline`, `tier`, `model` and `reasons`.
+
+| ID | Prompt | Expected routing | Verify |
+|---|---|---|---|
+| **F1** Small talk | `Thanks!` | Concierge drops FLASH → **LITE** (`reasons: ["small_talk"]`) | `model_routed` with `tier=LITE` |
+| **F2** Simple short trip | `Plan me a 2-day trip to Porto starting 2026-11-05 for 1 person, total budget $900.` | Extractor/scouts/analyst on **LITE**; drafter de-escalates PRO → **FLASH** (`simple_short_trip`) | `agent=itinerary_drafter tier=FLASH` |
+| **F3** Complex trip | `Plan 10 days in Japan from 2026-11-10 for 6 people, $4000 total, vegetarian, wheelchair accessible, love temples, onsen and anime.` | Drafter on **PRO**. Auditor/presenter/insights escalate to **PRO** (complexity ≥ 3) | `escalated=true`, reason `complex_trip:long_trip,large_party,…` |
+| **F4** Over-budget refine | C4 (tight Zurich budget) | Refiner escalates to **PRO** with reason `hard_refinement(over=…,complexity=…)` | `agent=itinerary_refiner tier=PRO` |
+| **F5** Failover | Locally: `MODEL_PRO=gemini-does-not-exist uv run python scripts/smoke_test.py "<F3 prompt>"` | Drafter call fails, gets retried on FLASH, and the plan still completes | Log `model_failover` (`from` → `to`) |
+| **F6** Policy unit tests | `uv run pytest tests/unit/test_routing_hitl.py -k routing` | All pass | — |
+
+### G. Human-in-the-loop (high-stakes actions)
+
+> `agents-cli run` cannot answer confirmation prompts. Use the **playground**
+> (`agents-cli playground`), which shows an approve/reject card, or the
+> scripted demo `uv run python scripts/hitl_demo.py [--reject]`, which acts as
+> the reviewer by sending an `adk_request_confirmation` FunctionResponse.
+
+| ID | Prompt / action | Expected behaviour | Verify |
+|---|---|---|---|
+| **G1** Booking approved | After a saved plan (F2): `Please place a booking hold for that trip. My email is traveler@example.com, don't go above $900.` → **Approve** | Agent pauses with a confirmation showing the destination, cost, cap and a masked email (`t***@example.com`). After approval it returns `submitted` with reference `WW-XXXXXX` | `user:booking_requests` in State; logs `hitl_requested` → `hitl_approved` |
+| **G2** Booking rejected | Same as G1 → **Reject** (or `hitl_demo.py --reject`) | Agent confirms nothing was booked | Status `rejected_by_human`; log `hitl_rejected`; no booking record |
+| **G3** Over-budget save override | Plan with an impossible budget: `Plan 3 days in Zurich from 2026-10-20 for 2 people, budget $150.` | Loop ends still over budget, so `save_trip_plan` **pauses for an override** instead of saving silently. Approve → saved; reject → not saved | `adk_request_confirmation` for `save_trip_plan`; `user:saved_trips` only after approval |
+| **G4** Edited cap below cost | In G1, edit the payload to `max_total_usd: 50` and approve | Tool refuses because the cap is below the audited cost, and asks for a higher cap | `status=error` with an explanatory message |
+| **G5** Invalid input never reaches a human | `Book a hold, email: not-an-email` | Validation error before any confirmation request | No `hitl_requested` log |
+| **G6** Unit tests | `uv run pytest tests/unit/test_routing_hitl.py -k "booking or override"` | All pass | — |
 
 ---
 

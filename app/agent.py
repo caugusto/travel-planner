@@ -18,7 +18,8 @@
 Agent graph
 -----------
 travel_planner (LlmAgent, concierge/router)
- |  tools: profile memory, quick-answer tools, Memory Bank preload
+ |  tools: profile memory, quick-answer tools, Memory Bank preload,
+ |         request_booking_hold (human-in-the-loop approval)
  └─ trip_planning_pipeline (SequentialAgent)
      1. trip_request_extractor   LlmAgent -> structured TripRequest (output_schema)
      2. research_team            ParallelAgent (fan-out, ~3x faster)
@@ -29,7 +30,11 @@ travel_planner (LlmAgent, concierge/router)
      4. budget_review_loop       LoopAgent (max 3) - critic/refiner pattern
           ├─ budget_auditor        code-based audit; exit_loop when approved
           └─ itinerary_refiner     rewrites draft from auditor feedback
-     5. itinerary_presenter      policy-gated save_trip_plan + final answer
+     5. itinerary_presenter      policy-gated save_trip_plan (+ HITL override
+                                 when over budget) + final answer
+
+Cross-cutting: ModelRouterPlugin (LITE/FLASH/PRO routing + failover),
+SafetyGuardrailPlugin, TravelTelemetryPlugin, BigQuery analytics.
 """
 
 import datetime
@@ -43,12 +48,12 @@ from google.adk.agents.context_cache_config import ContextCacheConfig
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.apps import App
 from google.adk.apps.app import EventsCompactionConfig
-from google.adk.models import Gemini
 from google.adk.plugins.bigquery_agent_analytics_plugin import (
     BigQueryAgentAnalyticsPlugin,
     BigQueryLoggerConfig,
 )
 from google.adk.tools.exit_loop_tool import exit_loop
+from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.google_search_tool import google_search
 from google.adk.tools.load_memory_tool import load_memory_tool
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
@@ -63,6 +68,7 @@ from app.guardrails import (
     require_budget_approval,
 )
 from app.observability import TravelTelemetryPlugin
+from app.routing import ModelRouterPlugin, model_for
 from app.tools import (
     convert_currency,
     estimate_trip_budget,
@@ -74,6 +80,7 @@ from app.tools import (
     save_trip_plan,
     validate_itinerary_budget,
 )
+from app.tools.booking import needs_budget_override, request_booking_hold
 from app.tools.profile import PROFILE_KEY, TRIPS_KEY
 
 # Gemini 3 models are served from the global endpoint; resolve project from
@@ -83,14 +90,9 @@ os.environ.setdefault("GOOGLE_CLOUD_PROJECT", _adc_project or "")
 os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "True")
 
-MODEL = "gemini-3.8-flash"
-
-
-def _model() -> Gemini:
-    return Gemini(
-        model=MODEL,
-        retry_options=types.HttpRetryOptions(attempts=3),
-    )
+# Model selection is strategic, not hard-coded: each agent gets a baseline
+# tier (LITE / FLASH / PRO) via model_for(), and ModelRouterPlugin escalates or
+# de-escalates per request. See app/routing.py.
 
 
 def _gen_config(temperature: float) -> types.GenerateContentConfig:
@@ -145,7 +147,7 @@ def extractor_instruction(ctx: ReadonlyContext) -> str:
 # --------------------------------------------------------------------------
 trip_request_extractor = Agent(
     name="trip_request_extractor",
-    model=_model(),
+    model=model_for("trip_request_extractor"),
     description="Turns the conversation into a structured TripRequest.",
     instruction=extractor_instruction,
     output_schema=TripRequest,
@@ -155,7 +157,7 @@ trip_request_extractor = Agent(
 
 destination_scout = Agent(
     name="destination_scout",
-    model=_model(),
+    model=model_for("destination_scout"),
     description="Location facts, weather outlook and public holidays.",
     instruction=prompts.DESTINATION_SCOUT,
     tools=[geocode_destination, get_weather_forecast, get_public_holidays],
@@ -166,7 +168,7 @@ destination_scout = Agent(
 
 local_insights_scout = Agent(
     name="local_insights_scout",
-    model=_model(),
+    model=model_for("local_insights_scout"),
     description="Current attractions, neighbourhoods and food via Google Search.",
     instruction=prompts.LOCAL_INSIGHTS_SCOUT,
     tools=[google_search],
@@ -176,7 +178,7 @@ local_insights_scout = Agent(
 
 budget_analyst = Agent(
     name="budget_analyst",
-    model=_model(),
+    model=model_for("budget_analyst"),
     description="Realistic cost envelope from a deterministic cost model.",
     instruction=prompts.BUDGET_ANALYST,
     tools=[geocode_destination, estimate_trip_budget, convert_currency],
@@ -193,7 +195,7 @@ research_team = ParallelAgent(
 
 itinerary_drafter = Agent(
     name="itinerary_drafter",
-    model=_model(),
+    model=model_for("itinerary_drafter"),
     description="Writes the day-by-day itinerary with a priced cost table.",
     instruction=prompts.ITINERARY_DRAFTER,
     include_contents="none",
@@ -203,7 +205,7 @@ itinerary_drafter = Agent(
 
 budget_auditor = Agent(
     name="budget_auditor",
-    model=_model(),
+    model=model_for("budget_auditor"),
     description="Audits the draft's costs in code; exits the loop when approved.",
     instruction=prompts.BUDGET_AUDITOR,
     tools=[validate_itinerary_budget, exit_loop],
@@ -214,7 +216,7 @@ budget_auditor = Agent(
 
 itinerary_refiner = Agent(
     name="itinerary_refiner",
-    model=_model(),
+    model=model_for("itinerary_refiner"),
     description="Revises the itinerary to address budget feedback.",
     instruction=prompts.ITINERARY_REFINER,
     include_contents="none",
@@ -231,10 +233,12 @@ budget_review_loop = LoopAgent(
 
 itinerary_presenter = Agent(
     name="itinerary_presenter",
-    model=_model(),
+    model=model_for("itinerary_presenter"),
     description="Presents and saves the approved itinerary.",
     instruction=prompts.ITINERARY_PRESENTER,
-    tools=[save_trip_plan],
+    # HITL: saving an itinerary that FAILED the budget audit pauses for an
+    # explicit human override (ADK tool confirmation).
+    tools=[FunctionTool(save_trip_plan, require_confirmation=needs_budget_override)],
     include_contents="none",
     before_tool_callback=require_budget_approval,
     generate_content_config=_gen_config(0.3),
@@ -265,10 +269,7 @@ root_agent = Agent(
     # gen_ai.agent.name. Renaming the agent only here makes the two disagree,
     # and anything selecting traces by name stops finding this agent's.
     name="travel_planner",
-    model=Gemini(
-        model=MODEL,
-        retry_options=types.HttpRetryOptions(attempts=3),
-    ),
+    model=model_for("travel_planner"),
     description="Wanderwise travel concierge: remembers travelers and plans trips.",
     instruction=concierge_instruction,
     tools=[
@@ -279,15 +280,17 @@ root_agent = Agent(
         geocode_destination,
         get_weather_forecast,
         convert_currency,
+        # HITL: always pauses for human approval (editable spending cap).
+        request_booking_hold,
     ],
     sub_agents=[trip_planning_pipeline],
     after_agent_callback=persist_to_memory_bank,
 )
 
 # --------------------------------------------------------------------------
-# Plugins: guardrails -> telemetry -> BigQuery analytics
+# Plugins: guardrails -> model routing -> telemetry -> BigQuery analytics
 # --------------------------------------------------------------------------
-_plugins = [SafetyGuardrailPlugin(), TravelTelemetryPlugin()]
+_plugins = [SafetyGuardrailPlugin(), ModelRouterPlugin(), TravelTelemetryPlugin()]
 _project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
 _dataset_id = os.environ.get("BQ_ANALYTICS_DATASET_ID", "adk_agent_analytics")
 # BigQuery needs a real data location (GOOGLE_CLOUD_LOCATION is "global").

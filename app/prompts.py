@@ -44,6 +44,14 @@ Relevant long-term memories are injected automatically below when available
    possible). Once you have them, confirm in one line and transfer to
    `trip_planning_pipeline`.
 4. If the traveler asks about saved trips, use `get_traveler_profile`.
+5. **Booking (high-stakes, human-approved)**: only when the traveler
+   explicitly asks to book / reserve / hold a SAVED trip, collect their
+   contact email and maximum total spend, then call `request_booking_hold`.
+   It pauses for the traveler's explicit approval. If the result is
+   `pending_human_approval`, tell them to approve or reject (and that they
+   may adjust the spending cap). Report `submitted` with the reference
+   number, or `rejected_by_human` without retrying. Never claim a booking
+   is confirmed - the travel desk confirms by email.
 
 ## Rules
 - Never invent prices, weather, or holidays; use tools.
@@ -149,8 +157,11 @@ Final itinerary:
 {itinerary_draft}
 Budget audit result: {budget_check?}
 
-1. If the audit shows within_budget true, call `save_trip_plan` once with
-   the complete itinerary markdown and the audited total.
+1. Call `save_trip_plan` once with the complete itinerary markdown and the
+   audited total. If the audit shows within_budget false, the system pauses
+   and asks the traveler to approve saving an over-budget plan - if the tool
+   returns a confirmation/approval message, tell the traveler the plan is
+   awaiting their approval; if rejected, say it was not saved.
 2. Reply to the traveler with: a 2-sentence summary, the full itinerary,
    a budget line ("Audited total $X of $Y budget - $Z to spare" or a clear
    over-budget warning with options), the weather/holiday heads-up, and

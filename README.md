@@ -26,10 +26,19 @@ produce a "perfect" itinerary that is **30% over budget**.
 
 ## 3. Architecture
 
+![Architecture](docs/architecture.jpg)
+
+> Full write-up with sequence diagrams: **[docs/architecture.md](docs/architecture.md)**.
+> Legend: 🟢 LITE `gemini-3.5-flash-lite` · 🔵 FLASH `gemini-3.8-flash` ·
+> 🟣 PRO `gemini-3.1-pro-preview` · 🧑 human-in-the-loop checkpoint.
+
 ```mermaid
 flowchart TD
     U([Traveler]) -->|chat| G[SafetyGuardrailPlugin<br/>PII redaction · injection block]
-    G --> R["travel_planner (LlmAgent)<br/>concierge / router"]
+    G --> MR{{"ModelRouterPlugin<br/>tier policy · dynamic escalation · failover"}}
+    MR --> R["🔵 travel_planner (LlmAgent)<br/>concierge / router · 🟢 for small talk"]
+    R --> BK["request_booking_hold<br/>🧑 ALWAYS requires approval"]
+    BK -->|approved + cap ≥ audited cost| BR[(user:booking_requests)]
     R -.->|PreloadMemoryTool / load_memory| MB[(Vertex AI<br/>Memory Bank)]
     R -->|save/get profile| ST[(user: state<br/>Agent Runtime Sessions)]
     R -->|quick answers| QT[geocode · weather · FX]
@@ -37,18 +46,18 @@ flowchart TD
 
     subgraph P["trip_planning_pipeline (SequentialAgent)"]
       direction TB
-      X["trip_request_extractor<br/>output_schema = TripRequest"] --> RT
+      X["🟢 trip_request_extractor<br/>output_schema = TripRequest"] --> RT
       subgraph RT["research_team (ParallelAgent)"]
-        D[destination_scout<br/>geocode · weather · holidays]
-        L[local_insights_scout<br/>Google Search]
-        B[budget_analyst<br/>cost model · FX]
+        D[🟢 destination_scout<br/>geocode · weather · holidays]
+        L[🔵 local_insights_scout<br/>Google Search]
+        B[🟢 budget_analyst<br/>cost model · FX]
       end
-      RT --> DR[itinerary_drafter]
+      RT --> DR["🟣 itinerary_drafter<br/>🔵 for trips ≤ 2 days"]
       DR --> LP
       subgraph LP["budget_review_loop (LoopAgent, max 3)"]
-        A[budget_auditor<br/>validate_itinerary_budget · exit_loop] --> F[itinerary_refiner]
+        A[🔵 budget_auditor<br/>validate_itinerary_budget · exit_loop] --> F["🔵 itinerary_refiner<br/>🟣 if >15% over or complex"]
       end
-      LP --> PR["itinerary_presenter<br/>save_trip_plan 🔒 policy-gated"]
+      LP --> PR["🔵 itinerary_presenter<br/>save_trip_plan 🔒 gated · 🧑 approval if over budget"]
     end
     PR -->|Markdown artifact| GCS[(GCS artifacts)]
     R -. after_agent .-> MB
@@ -68,8 +77,10 @@ flowchart TD
    (pure Python). If `within_budget` → it calls `exit_loop`.
 3. Otherwise it emits targeted cuts (most expensive items first) and
    `itinerary_refiner` rewrites the plan. Repeat ≤ 3×.
-4. `itinerary_presenter` may call `save_trip_plan` **only** if the last audit
-   passed — enforced by a `before_tool_callback`, not by prompt wording.
+4. `itinerary_presenter` calls `save_trip_plan`. A `before_tool_callback`
+   hard-blocks saving if no audit ran; if the audit **failed** (still over
+   budget after 3 rounds) the tool pauses for an explicit **human override**
+   (`require_confirmation=needs_budget_override`) instead of silently saving.
 
 ## 4. How it maps to the evaluation criteria
 
@@ -107,6 +118,26 @@ flowchart TD
   are complete; quick questions handled directly.
 - **Sequential** → **Parallel** fan-out → **Loop** (critic/refiner) → gated
   finaliser, all native ADK workflow agents.
+- **Strategic model routing** ([`app/routing.py`](app/routing.py)):
+  - *Static tiers* by task: extraction/lookups → 🟢 LITE, tool-calling and
+    critique → 🔵 FLASH, long-form creative planning → 🟣 PRO.
+  - *Dynamic escalation* by `ModelRouterPlugin.before_model_callback` using a
+    pure, unit-tested `decide()` policy: a `trip_complexity` score (long trip,
+    large party, many constraints, tight budget) and budget-audit overrun
+    escalate the refiner/auditor/presenter to PRO; trivial trips de-escalate
+    the drafter to FLASH; small talk drops the concierge to LITE.
+  - *Failover*: `on_model_error_callback` retries a failed call on the next
+    tier (PRO→FLASH→LITE) so one model outage never kills a session.
+  - Every decision emits a `model_routed` log + `travel.model.*` span attributes;
+    tiers are overridable via `MODEL_LITE/FLASH/PRO` env vars.
+- **Human-in-the-loop for high-stakes actions** (ADK tool confirmation):
+  - `request_booking_hold` *always* pauses for human approval; the reviewer
+    can edit the spending cap (`payload.max_total_usd`), which is re-validated
+    against the audited cost; rejections are respected and logged.
+  - `save_trip_plan` asks for an explicit override only when the budget audit
+    failed (`require_confirmation=<predicate>`).
+  - `hitl_requested / hitl_approved / hitl_rejected` audit events; email is
+    masked in prompts and logs.
 - Deterministic guards where correctness matters: budget math in code,
   policy gate on saving, injection short-circuit before any model call.
 - Graceful degradation: `on_tool_error_callback` converts unexpected
@@ -162,7 +193,8 @@ Try:
 > verification steps: **[TESTING.md](TESTING.md)**
 
 ```bash
-uv run pytest tests/unit                 # 22 offline tests (tools, guardrails, policy gate)
+uv run pytest tests/unit                 # 34 offline tests (tools, guardrails, routing, HITL)
+uv run python scripts/hitl_demo.py       # live demo: model routing + human approval flow
 uv run pytest tests/integration          # real Gemini: streaming, memory, guardrails
 agents-cli eval run                      # 9-case eval suite with LLM judge
 ```
@@ -181,9 +213,10 @@ agents-cli infra cicd --cicd-runner google_cloud_build ...   # CI/CD pipelines
 app/
 ├── agent.py            # agent graph, App (plugins, compaction, caching)
 ├── prompts.py          # all instructions (context-engineered)
+├── routing.py          # model tiers, dynamic escalation policy, failover plugin
 ├── guardrails.py       # PII/injection plugin, budget policy gate, Memory Bank push
 ├── observability.py    # telemetry plugin: JSON logs, OTel metrics, span attrs
-├── tools/              # destination, budget, profile tools + resilient HTTP
+├── tools/              # destination, budget, profile, booking (HITL) + resilient HTTP
 ├── app_utils/services.py  # sessions / artifacts / Memory Bank wiring
 └── fast_api_app.py     # ADK API + A2A + Agent Runtime adapter
 tests/{unit,integration,eval,load_test}

@@ -257,6 +257,10 @@ def _safe(args: dict[str, Any], limit: int = 300) -> dict[str, Any]:
     """Truncate large args (e.g. itinerary markdown) before logging."""
     out = {}
     for k, v in args.items():
+        if "email" in k and isinstance(v, str) and "@" in v:
+            user, _, domain = v.partition("@")
+            out[k] = f"{user[:1]}***@{domain}"
+            continue
         s = v if isinstance(v, (int, float, bool)) else str(v)
         out[k] = s[:limit] + "..." if isinstance(s, str) and len(s) > limit else s
     return out

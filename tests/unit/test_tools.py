@@ -252,11 +252,14 @@ def test_prompt_injection_detection(msg, expected) -> None:
     assert guardrails.is_prompt_injection(msg) is expected
 
 
-def test_budget_policy_gate_blocks_unapproved_save() -> None:
+def test_budget_policy_gate_blocks_unaudited_save() -> None:
     tool = SimpleNamespace(name="save_trip_plan")
     blocked = guardrails.require_budget_approval(tool, {}, FakeToolContext())
     assert blocked and blocked["status"] == "error"
     approved = FakeToolContext({"budget_check": {"within_budget": True}})
     assert guardrails.require_budget_approval(tool, {}, approved) is None
+    # Over budget passes the gate -> handled by the HITL override instead.
+    over = FakeToolContext({"budget_check": {"within_budget": False}})
+    assert guardrails.require_budget_approval(tool, {}, over) is None
     other = SimpleNamespace(name="geocode_destination")
     assert guardrails.require_budget_approval(other, {}, FakeToolContext()) is None

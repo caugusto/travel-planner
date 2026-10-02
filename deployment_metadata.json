@@ -4,5 +4,16 @@
   "deployment_target": "agent_runtime",
   "is_a2a": true,
   "language": "python",
-  "agent_directory": "app"
+  "agent_directory": "app",
+  "pending_operation": {
+    "owner_id": "745be20b9a024112804accad3a351c60",
+    "state": "running",
+    "operation_name": "projects/16933400417/locations/us-central1/reasoningEngines/1862290672720019456/operations/3434122521211830272",
+    "project": "agentspace-452714",
+    "location": "us-central1",
+    "deployment_target": "agent_runtime",
+    "started_at": "2026-10-02T20:22:31.521808+00:00",
+    "owner_pid": 34176,
+    "owner_host": "caugusto-mac.roam.internal"
+  }
 }

@@ -1,0 +1,19 @@
+name: 'travel-planner'
+acli_version: '1.8.0'
+agent_directory: 'app'
+region: 'us-central1'
+base_template: 'adk'
+generated_at: '2026-10-02T19:39:27.050335+00:00'
+language: 'python'
+framework: 'google-adk'
+create_params:
+  # The ADK name of the root agent, as rendered into the agent source. Rename
+  # the agent and you must change it in both places: telemetry reports this as
+  # gen_ai.agent.name, and it is what agents-cli reports for the project.
+  root_agent_name: 'travel_planner'
+  deployment_target: 'agent_runtime'
+  session_type: 'none'
+  cicd_runner: 'google_cloud_build'
+  is_a2a: true
+  agent_gateway: False
+  agent_guidance_filename: 'GEMINI.md'

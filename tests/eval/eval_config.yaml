@@ -1,0 +1,24 @@
+metrics_to_run:
+  - custom_response_quality
+  - tool_error_free
+  - agent_turn_count
+
+custom_metrics:
+  # Default: local LLM-as-judge (see response_quality.py). Runs in-process via
+  # google-genai on Agent Platform (ADC) or Google AI Studio (GEMINI_API_KEY).
+  - name: custom_response_quality
+    custom_function_file: response_quality.py
+  - name: agent_turn_count
+    custom_function: |
+      def evaluate(instance):
+          turns = (instance.get("agent_data") or {}).get("turns", [])
+          return {'score': len(turns)}
+  # Deterministic: 1.0 when no tool in the trace returned status=error.
+  - name: tool_error_free
+    custom_function: |
+      def evaluate(instance):
+          import json
+          trace = json.dumps(instance.get("agent_data") or {})
+          errors = trace.count('"status": "error"')
+          return {'score': 1.0 if errors == 0 else 0.0,
+                  'explanation': f'{errors} tool error(s) in trace'}

@@ -158,6 +158,9 @@ Try:
 4. Start a **new session** and ask *"What do you remember about me?"*
 
 ### Tests & evals
+> 📋 Full test plan with 30+ sample prompts, expected behaviour and
+> verification steps: **[TESTING.md](TESTING.md)**
+
 ```bash
 uv run pytest tests/unit                 # 22 offline tests (tools, guardrails, policy gate)
 uv run pytest tests/integration          # real Gemini: streaming, memory, guardrails
